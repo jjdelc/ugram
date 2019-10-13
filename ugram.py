@@ -8,6 +8,7 @@ from urllib.parse import urlencode, urlparse
 
 
 PROFILE = "https://www.instagram.com/{}"
+DETAIL_URL = "https://www.instagram.com/p/{}/"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:71.0) Gecko/20100101 Firefox/71.0"
 
 log.basicConfig(level=log.DEBUG)
@@ -93,6 +94,7 @@ class Post:
             "content": self.pic.text,
             "h": "entry",
             "photo": photo_url,
+            "syndication": DETAIL_URL.format(self.pic.code),
             "published": datetime.fromtimestamp(self.pic.timestamp).isoformat(),
             "mp-syndicate-to": "twitter"  # Should read from mp_config
         }
