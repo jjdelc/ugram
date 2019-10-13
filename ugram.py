@@ -23,6 +23,13 @@ def fetch_profile(profile_url):
 
 
 def parse(profile_html):
+    """
+    Given the bare HTML from GETting to an IG user's profile, extract only
+    the JSON payload that contains the user's information.
+
+    :param profile_html: raw HTML from user's profile
+    :return: Dict with user's data
+    """
     scripts, partial = [], []
     for line in profile_html.split("\n"):
         if "<script " in line:
@@ -41,6 +48,12 @@ def parse(profile_html):
 
 
 def extract_pictures(payload):
+    """
+    :param payload: This dict should be extracted from the HTML of the user
+        profile, and contains the whole user's data. We'll extract only the
+        pictures from this.
+    :return: List of dictionaries for the pictures found in the JSON payload
+    """
     user_payload = payload["entry_data"]["ProfilePage"][0]["graphql"]["user"]
     pictures = user_payload["edge_owner_to_timeline_media"]["edges"]
     log.debug("Found {} pictures".format(len(pictures)))
@@ -48,6 +61,10 @@ def extract_pictures(payload):
 
 
 class IGPic:
+    """
+    A wrapper around the IG bare HTML JSON structure, in order to strip out
+    the attributes we care for.
+    """
     def __init__(self, node):
         node = node["node"]
         self.code = node["shortcode"]
@@ -111,6 +128,15 @@ class Post:
 
 
 def encode_multipart_formdata(fh, filename):
+    """
+    Can't believe I need to spell out this function, but this is needed in order
+    to upload a file using urllib.urlopen. Note that this will perform the
+    upload with a single file under the `file` form field.
+
+    :param fh: File-like object
+    :param filename: filename of such file
+    :return: (content type string, body bytes as needed by urlopen)
+    """
     BOUNDARY = b"________ThIs_Is_tHe_bouNdaRY_$"
     lines = []
     value = fh.read()
@@ -128,6 +154,13 @@ def encode_multipart_formdata(fh, filename):
 
 
 def _upload_media(media_endpoint, media_fh, token, filename):
+    """
+    :param media_endpoint: URL where to POST the upload
+    :param media_fh: file-like object to upload
+    :param token: Bearer token for the MP media endpoint
+    :param filename: Filename of identify the file as to the server
+    :return: URL of the uploaded file
+    """
     log.debug("Uploading picture to media endpoint")
     content_type, body = encode_multipart_formdata(media_fh, filename)
     request = Request(media_endpoint, data=body, headers={
@@ -158,8 +191,15 @@ def main(config, pic_id):
     post.post()
 
 
-if __name__ == "__main__":
+def _run_script():
+    """
+    Wrapper function because we don't want anything else in the global scope.
+    """
     config_file = sys.argv[1]
     _pic_id = sys.argv[2]
     _config = json.load(open(config_file))
     main(_config, _pic_id)
+
+
+if __name__ == "__main__":
+    _run_script()
