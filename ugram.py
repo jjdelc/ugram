@@ -99,7 +99,6 @@ class Post:
             filename = basename(urlparse(picture_url).path)
             photo_url = self.post_media(mp_endpoint, media_fh, filename)
             uploaded_urls.append(photo_url)
-            log.debug("Uploaded: {}".format(photo_url))
         return uploaded_urls
 
     def build_body(self):
