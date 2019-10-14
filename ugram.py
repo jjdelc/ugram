@@ -14,25 +14,25 @@ UA = "Mozilla/5.0 (X11; Linux x86_64; rv:71.0) Gecko/20100101 Firefox/71.0"
 log.basicConfig(level=log.DEBUG)
 
 
-def fetch_profile(profile_url):
-    log.debug("Reading Instagram profile: {}".format(profile_url))
-    req = Request(profile_url, headers={
+def fetch_html(url):
+    log.debug("Reading Instagram: {}".format(url))
+    req = Request(url, headers={
         "User-Agent": UA
     })
-    profile_html = urlopen(req).read().decode("utf-8")
-    return profile_html
+    raw_html = urlopen(req).read().decode("utf-8")
+    return raw_html
 
 
-def parse(profile_html):
+def parse(raw_html):
     """
     Given the bare HTML from GETting to an IG user's profile, extract only
     the JSON payload that contains the user's information.
 
-    :param profile_html: raw HTML from user's profile
+    :param raw_html: raw HTML from user's profile
     :return: Dict with user's data
     """
     scripts, partial = [], []
-    for line in profile_html.split("\n"):
+    for line in raw_html.split("\n"):
         if "<script " in line:
             partial.append(line)
         elif "</script>" in line:
@@ -41,7 +41,7 @@ def parse(profile_html):
             scripts.extend(nodes)
             partial = []
 
-    content_node = [s for s in scripts if "biography" in s][0]
+    content_node = [s for s in scripts if "biography" in s or "PostPage" in s][0]
     # Matches script that starts with `window._sharedData = ....`
     json_content = content_node.split(" = ")[1].replace("</script>", "").rstrip(";")
     payload = json.loads(json_content)
@@ -58,7 +58,12 @@ def extract_pictures(payload):
     user_payload = payload["entry_data"]["ProfilePage"][0]["graphql"]["user"]
     pictures = user_payload["edge_owner_to_timeline_media"]["edges"]
     log.debug("Found {} pictures".format(len(pictures)))
-    return pictures
+    return [p["node"] for p in pictures]
+
+
+def extract_single_post(payload):
+    post = payload["entry_data"]["PostPage"][0]["graphql"]["shortcode_media"]
+    return [post]
 
 
 class IGPic:
@@ -67,13 +72,15 @@ class IGPic:
     the attributes we care for.
     """
     def __init__(self, node):
-        node = node["node"]
         self.code = node["shortcode"]
-        self.thumb = node["thumbnail_src"]
-        self.dims = node["dimensions"]
-        self.picture_url = node["display_url"]
+        self.video = node["is_video"]
         self.timestamp = node["taken_at_timestamp"]
         self.text = node["edge_media_to_caption"]["edges"][0]["node"]["text"]
+        if "edge_sidecar_to_children" in node:  # Multi pic?
+            self.pictures = [n["node"]["display_url"]
+                             for n in node["edge_sidecar_to_children"]["edges"]]
+        else:
+            self.pictures = [node["display_url"]]
 
 
 class Post:
@@ -82,18 +89,25 @@ class Post:
         self.endpoint = endpoint
         self.token = token
 
-    def build_body(self):
+    def upload_media(self):
         mp_config = self.mp_config()
+        log.debug("Downloading images from Instagram")
+        uploaded_urls = []
+        mp_endpoint = mp_config["media-endpoint"]
+        for picture_url in self.pic.pictures:
+            media_fh = urlopen(picture_url)
+            filename = basename(urlparse(picture_url).path)
+            photo_url = self.post_media(mp_endpoint, media_fh, filename)
+            uploaded_urls.append(photo_url)
+            log.debug("Uploaded: {}".format(photo_url))
+        return uploaded_urls
 
-        log.debug("Downloading image from Instagram")
-        media_fh = urlopen(self.pic.picture_url)
-        filename = basename(urlparse(self.pic.picture_url).path)
-        photo_url = self.post_media(mp_config["media-endpoint"], media_fh, filename)
-
+    def build_body(self):
+        uploaded_urls = self.upload_media()
         body = {
             "content": self.pic.text,
             "h": "entry",
-            "photo": photo_url,
+            "photo": uploaded_urls,
             "syndication": DETAIL_URL.format(self.pic.code),
             "published": datetime.fromtimestamp(self.pic.timestamp).isoformat(),
             "mp-syndicate-to": "twitter"  # Should read from mp_config
@@ -116,7 +130,7 @@ class Post:
     def post(self):
         body = self.build_body()
         log.debug("Posting to {}".format(self.endpoint))
-        body = urlencode(body).encode("utf-8")
+        body = urlencode(body, doseq=True).encode("utf-8")
         request = Request(self.endpoint, data=body, headers={
             "Authorization": "Bearer {}".format(self.token),
         })
@@ -184,11 +198,24 @@ def main(config, pic_id):
     mp_endpoint = config["endpoint"]
     token = config["token"]
 
-    html = fetch_profile(profile_url)
+    html = fetch_html(profile_url)
     doc = parse(html)
     pictures = extract_pictures(doc)
     pictures = [IGPic(n) for n in pictures]
     pic = [p for p in pictures if p.code in pic_id][0]
+    post = Post(pic, mp_endpoint, token)
+    post.post()
+
+
+def post_single_picture(config, pic_url):
+    mp_endpoint = config["endpoint"]
+    token = config["token"]
+
+    html = fetch_html(pic_url)
+    doc = parse(html)
+    pictures = extract_single_post(doc)
+    pictures = [IGPic(n) for n in pictures]
+    pic = [p for p in pictures if p.code in pic_url][0]
     post = Post(pic, mp_endpoint, token)
     post.post()
 
@@ -198,9 +225,9 @@ def _run_script():
     Wrapper function because we don't want anything else in the global scope.
     """
     config_file = sys.argv[1]
-    _pic_id = sys.argv[2]
-    _config = json.load(open(config_file))
-    main(_config, _pic_id)
+    pic_url = sys.argv[2]
+    config = json.load(open(config_file))
+    post_single_picture(config, pic_url)
 
 
 if __name__ == "__main__":
