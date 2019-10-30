@@ -224,9 +224,11 @@ def _run_script():
     Wrapper function because we don't want anything else in the global scope.
     """
     config_file = sys.argv[1]
-    pic_url = sys.argv[2]
+    pic_urls = sys.argv[2:]
     config = json.load(open(config_file))
-    post_single_picture(config, pic_url)
+    for pic_url in pic_urls:
+        post_single_picture(config, pic_url)
+    log.info("Done!")
 
 
 if __name__ == "__main__":
