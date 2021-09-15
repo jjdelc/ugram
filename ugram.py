@@ -32,8 +32,11 @@ def parse(raw_html):
     :return: Dict with user's data
     """
     scripts, partial = [], []
-    for line in raw_html.split("\n"):
-        if "<script " in line:
+    # Split where there are two <script> tags in the same line!
+    raw_html = raw_html.replace("/script><script", "/script>\n<script")
+    html_lines = raw_html.split("\n")
+    for line in html_lines:
+        if "<script" in line:
             partial.append(line)
         elif "</script>" in line:
             scripts_text = " ".join(partial)
