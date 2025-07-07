@@ -27,7 +27,7 @@ You need to generate a JSON file with the following shape:
 Then run the following in your terminal:
 
 ```
-$ python ugram.py config,json <IG post URL>
+$ python ugram.py config.json <IG post URL>
 ```
 
 ## Media upload

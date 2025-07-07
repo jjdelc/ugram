@@ -1,17 +1,31 @@
 import sys
 import json
+import argparse
 import logging as log
+from html import unescape
 from os.path import basename
 from datetime import datetime
 from urllib.request import urlopen, Request
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urljoin
 
 
 PROFILE = "https://www.instagram.com/{}"
 DETAIL_URL = "https://www.instagram.com/p/{}/"
+EMBED_URL = "https://www.instagram.com/p/{}/embed/"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:71.0) Gecko/20100101 Firefox/71.0"
 
+
 log.basicConfig(level=log.DEBUG)
+
+
+def fetch_ig_post_data(pic_url):
+    detail_html = fetch_html(pic_url)
+    embed_html = fetch_html(urljoin(pic_url, "embed/"))
+    pic_data = parse(detail_html, embed_html)
+    code = pic_url.split("/")[-2]
+    pic_data["code"] = code
+    pic_data["post_url"] = pic_url
+    return pic_data
 
 
 def fetch_html(url):
@@ -23,32 +37,31 @@ def fetch_html(url):
     return raw_html
 
 
-def parse(raw_html):
+def parse(raw_html, embed_html):
     """
-    Given the bare HTML from GETting to an IG user's profile, extract only
-    the JSON payload that contains the user's information.
-
-    :param raw_html: raw HTML from user's profile
+    :param raw_html: raw HTML for the detail page
+    :param embed_html: raw HTML for the embed page
     :return: Dict with user's data
     """
-    scripts, partial = [], []
-    # Split where there are two <script> tags in the same line!
-    raw_html = raw_html.replace("/script><script", "/script>\n<script")
-    html_lines = raw_html.split("\n")
-    for line in html_lines:
-        if "<script" in line:
-            partial.append(line)
-        elif "</script>" in line:
-            scripts_text = " ".join(partial)
-            nodes = scripts_text.split("</script>")
-            scripts.extend(nodes)
-            partial = []
+    description, img_url, is_video = None, None, False
+    for line in raw_html.split("\n"):
+        if "og:title" in line:
+            description = line.split('"og:title"')[1][10:].split('"')[0]
+            description = unescape(description)
+            description = description.split(": ")[1].strip('"')
+            break
 
-    content_node = [s for s in scripts if "biography" in s or "PostPage" in s][0]
-    # Matches script that starts with `window._sharedData = ....`
-    json_content = content_node.split(" = ")[1].replace("</script>", "").rstrip(";")
-    payload = json.loads(json_content)
-    return payload
+    for line in embed_html.split("\n"):
+        if "EmbeddedMediaImage" in line:
+            img_url = line.split("src=")[2][1:].split('"')[0]
+            img_url = unescape(img_url)
+
+    import pdb;pdb.set_trace()
+    return {
+        "image_url": img_url,
+        "description": description,
+        "is_video": is_video
+    }
 
 
 def extract_pictures(payload):
@@ -64,78 +77,82 @@ def extract_pictures(payload):
     return [p["node"] for p in pictures]
 
 
-def extract_single_post(payload):
-    post = payload["entry_data"]["PostPage"][0]["graphql"]["shortcode_media"]
-    return [post]
+class MicroPubSite:
+    """
+    Discovers the Micropub config available from the site.
+    """
+
+    def __init__(self, endpoint, token):
+        self.endpoint = endpoint
+        self.token = token
+        self.headers = {"Authorization": "Bearer {}".format(self.token)}
+        self.mp_config = self.fetch_mp_config()
+
+    def fetch_mp_config(self):
+        log.debug("Discovering Micropub config")
+        url = self.endpoint + "?" + urlencode({"q": "config"})
+        request = Request(url, headers=self.headers)
+        mp_config = urlopen(request).read().decode("utf-8")
+        mp_config = json.loads(mp_config)
+        return mp_config
 
 
-class IGPic:
+class IGPost:
     """
     A wrapper around the IG bare HTML JSON structure, in order to strip out
     the attributes we care for.
     """
     def __init__(self, node):
-        self.code = node["shortcode"]
+        self.code = node["code"]
         self.video = node["is_video"]
-        self.timestamp = node["taken_at_timestamp"]
-        self.text = node["edge_media_to_caption"]["edges"][0]["node"]["text"]
-        if "edge_sidecar_to_children" in node:  # Multi pic?
-            self.pictures = [n["node"]["display_url"]
-                             for n in node["edge_sidecar_to_children"]["edges"]]
-        else:
-            self.pictures = [node["display_url"]]
+        self.text = node["description"]
+        self.picture_urls = [node["image_url"]]
 
 
 class Post:
-    def __init__(self, pic, endpoint, token):
-        self.pic = pic
-        self.endpoint = endpoint
-        self.token = token
+    def __init__(self, ig_post, publish_date):
+        self.ig_post = ig_post
+        self.publish_date = publish_date
 
-    def upload_media(self):
-        mp_config = self.mp_config()
+    def upload_media(self, site):
         log.debug("Downloading images from Instagram")
         uploaded_urls = []
-        mp_endpoint = mp_config["media-endpoint"]
-        for picture_url in self.pic.pictures:
+        for picture_url in self.ig_post.picture_urls:
             media_fh = urlopen(picture_url)
             filename = basename(urlparse(picture_url).path)
-            photo_url = self.post_media(mp_endpoint, media_fh, filename)
+            photo_url = self.post_media(site, media_fh, filename)
             uploaded_urls.append(photo_url)
         return uploaded_urls
 
-    def build_body(self):
-        uploaded_urls = self.upload_media()
-        body = {
-            "content": self.pic.text,
+    def build_body(self, uploaded_urls):
+        unique_keys = {
+            "content": self.ig_post.text,
             "h": "entry",
             "photo": uploaded_urls,
-            "syndication": DETAIL_URL.format(self.pic.code),
-            "published": datetime.fromtimestamp(self.pic.timestamp).isoformat(),
-            "mp-syndicate-to": "twitter"  # Should read from mp_config
+            "syndication": DETAIL_URL.format(self.ig_post.code),
         }
+        multi_keys = [
+            ("mp-syndicate-to", "twitter"),  # Should read from mp_config
+            ("mp-syndicate-to", "mastodon"),
+        ]
+        body = list(unique_keys.items())
+        body.extend(multi_keys)
+        if self.publish_date:
+            publish_date = self.publish_date.isoformat()
+            body.append(("published", publish_date))
         return body
 
-    def mp_config(self):
-        log.debug("Discovering Micropub config")
-        request = Request(self.endpoint + "?" + urlencode({"q": "config"}), headers={
-            "Authorization": "Bearer {}".format(self.token)
-        })
-        mp_config = urlopen(request).read().decode("utf-8")
-        mp_config = json.loads(mp_config)
-        return mp_config
-
-    def post_media(self, media_endpoint, media_fh, filename):
-        photo_url = _upload_media(media_endpoint, media_fh, self.token, filename)
+    def post_media(self, site, media_fh, filename):
+        media_endpoint = site.mp_config["media-endpoint"]
+        photo_url = _upload_media(media_endpoint, media_fh, site.token, filename)
         return photo_url
 
-    def post(self):
-        body = self.build_body()
-        log.debug("Posting to {}".format(self.endpoint))
+    def post(self, site):
+        uploaded_urls = self.upload_media(site)
+        body = self.build_body(uploaded_urls)
+        log.debug("Posting to {}".format(site.endpoint))
         body = urlencode(body, doseq=True).encode("utf-8")
-        request = Request(self.endpoint, data=body, headers={
-            "Authorization": "Bearer {}".format(self.token),
-        })
+        request = Request(site.endpoint, data=body, headers=site.headers)
         response = urlopen(request)
         if response.status == 201:
             post_url = response.headers.get("Location")
@@ -195,44 +212,49 @@ def _upload_media(media_endpoint, media_fh, token, filename):
         raise ValueError(response.reason)
 
 
-def main(config, pic_id):
-    profile_url = PROFILE.format(config["user"])
-    mp_endpoint = config["endpoint"]
-    token = config["token"]
+def post_single_ig_post(site, pic_url, publish_date):
+    # A single IG post can have multiple pictures.
+    post_data = fetch_ig_post_data(pic_url)
+    if not publish_date and "taken_at_timestamp" in post_data:
+        timestamp = node["taken_at_timestamp"]
+        publish_date = datetime.fromtimestamp(timestamp).isoformat()
 
-    html = fetch_html(profile_url)
-    doc = parse(html)
-    pictures = extract_pictures(doc)
-    pictures = [IGPic(n) for n in pictures]
-    pic = [p for p in pictures if p.code in pic_id][0]
-    post = Post(pic, mp_endpoint, token)
-    post.post()
+    ig_post = IGPost(post_data)
+    post = Post(ig_post, publish_date)
+    post.post(site)
 
 
-def post_single_picture(config, pic_url):
-    mp_endpoint = config["endpoint"]
-    token = config["token"]
-
-    html = fetch_html(pic_url)
-    doc = parse(html)
-    pictures = extract_single_post(doc)
-    pictures = [IGPic(n) for n in pictures]
-    pic = [p for p in pictures if p.code in pic_url][0]
-    post = Post(pic, mp_endpoint, token)
-    post.post()
-
-
-def _run_script():
+def _run_script(config, pic_urls, publish_date):
     """
     Wrapper function because we don't want anything else in the global scope.
     """
-    config_file = sys.argv[1]
-    pic_urls = sys.argv[2:]
-    config = json.load(open(config_file))
+    mp_endpoint = config["endpoint"]
+    token = config["token"]
+    site = MicroPubSite(mp_endpoint, token)
     for pic_url in pic_urls:
-        post_single_picture(config, pic_url)
+        post_single_ig_post(site, pic_url, publish_date)
     log.info("Done!")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="uGram", description="Micropub post from Instagram")
+    parser.add_argument('config',
+        type=argparse.FileType("r", encoding="utf-8"))
+    parser.add_argument('urls', nargs="+")
+    parser.add_argument('-d', '--date', default=None)
+    args = parser.parse_args()
+    return args
+
+
+def __main():
+    args = parse_args()
+    config = json.load(args.config)
+    publish_date = datetime.froisoformat(args.date) if args.date else None
+    pic_urls = args.urls
+
+    _run_script(config, pic_urls, publish_date)
+
+
 if __name__ == "__main__":
-    _run_script()
+    __main()
