@@ -1,4 +1,4 @@
-import sys
+import re
 import json
 import argparse
 import logging as log
@@ -13,9 +13,21 @@ PROFILE_URL = "https://www.instagram.com/{}"
 DETAIL_URL = "https://www.instagram.com/p/{}/"
 EMBED_URL = "https://www.instagram.com/p/{}/embed/"
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:71.0) Gecko/20100101 Firefox/71.0"
-
+REQ_HEADERS = {"User-Agent": UA}
 
 log.basicConfig(level=log.DEBUG)
+
+
+def str2bool(v):
+    """Parses flexible boolean inputs."""
+    if isinstance(v, bool):
+       return v
+    if v.lower() in {'yes', 'true', 't', 'y', '1'}:
+        return True
+    elif v.lower() in {'no', 'false', 'f', 'n', '0'}:
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected (True/False).')
 
 
 def encode_multipart_formdata(fh, filename):
@@ -112,32 +124,36 @@ class IGPost:
     def __init__(self, node):
         self.code = node["code"]
         self.video = node["is_video"]
-        self.text = node["description"]
-        self.picture_urls = [node["image_url"]]
+        self.text = node["text"]
+
+        # If carousel_urls exist, then that will contain the main photo
+        # already, so no need to use both
+        if "carousel_urls" in node:
+            self.picture_urls = node["carousel_urls"]
+        else:
+            self.picture_urls = [node["image_url"]]
 
         publish_date = None
-        if "taken_at_timestamp" in node:
-            timestamp = node["taken_at_timestamp"]
-            publish_date = datetime.fromtimestamp(timestamp).isoformat()
+        if "created_at" in node:
+            timestamp = node["created_at"]
+            publish_date = datetime.fromtimestamp(timestamp)
 
         self.publish_date = publish_date
 
     @classmethod
-    def fetch_ig_post_data(cls, pic_url):
-        detail_html = cls.fetch_html(pic_url)
-        embed_html = cls.fetch_html(urljoin(pic_url, "embed/"))
+    def fetch_ig_post_data(cls, pub_url):
+        detail_html = cls.fetch_html(pub_url)
+        embed_html = cls.fetch_html(urljoin(pub_url, "embed/"))
         pic_data = cls.parse(detail_html, embed_html)
-        code = pic_url.split("/")[-2]
+        code = pub_url.split("/")[-2]
         pic_data["code"] = code
-        pic_data["post_url"] = pic_url
+        pic_data["post_url"] = pub_url
         return pic_data
 
     @classmethod
     def fetch_html(cls, url):
         log.debug("Reading Instagram: {}".format(url))
-        req = Request(url, headers={
-            "User-Agent": UA
-        })
+        req = Request(url, headers=REQ_HEADERS)
         raw_html = urlopen(req).read().decode("utf-8")
         return raw_html
 
@@ -156,21 +172,48 @@ class IGPost:
                 description = description.split(": ")[1].strip('"')
                 break
 
+        img_urls = []
+        # Iterate for the main image
         for line in embed_html.split("\n"):
             if "EmbeddedMediaImage" in line:
                 img_url = line.split("src=")[2][1:].split('"')[0]
                 img_url = unescape(img_url)
+                img_urls.append(img_url)
+                break
 
-        return {
+        # Now look for additional images in the post
+        line = embed_html.split("\n")[11]
+        js_content = re.sub(r'<script[^>]*>(.*?)', "", line, re.DOTALL)
+        js_content = re.search(r's\.handle\((.*?)\);requireLazy', js_content, re.DOTALL)
+        if js_content:
+            data = json.loads(js_content.group(1))
+            data = json.loads(data["require"][1][3][0]["contextJSON"])
+            edges = data['context']['media']['edge_sidecar_to_children']['edges']
+            more_pics = [edge['node']["display_resources"][-1]["src"] for edge in edges if "display_resources" in edge["node"]]
+            img_urls.extend(more_pics)
+
+        assert img_url is not None, "No image found from Instagram post HTML."
+        result = {
+            "text": description,
             "image_url": img_url,
-            "description": description,
-            "is_video": is_video
+            "is_video": is_video,
+            "video_url": None,
         }
+        if len(img_urls) > 1:
+            result["carousel_urls"] = img_urls
+        return result
 
     @classmethod
     def from_url(cls, post_url):
         post_data = cls.fetch_ig_post_data(post_url)
         return cls(post_data)
+
+    @classmethod
+    def from_filtered_node(cls, node) -> "IGPost":
+        """
+        Use this when using the HARness.py file filtered nodes
+        """
+        return cls(node)
 
 
 class Post:
@@ -192,17 +235,25 @@ class Post:
             uploaded_urls.append(photo_url)
         return uploaded_urls
 
-    def build_body(self, uploaded_urls):
+    def build_body(self, uploaded_urls, syndicate):
+        post_content = self.ig_post.text
+        main_photo, more_photos = uploaded_urls[0], uploaded_urls[1:]
+        if more_photos:
+            more_photos = ["![]({})".format(purl) for purl in more_photos]
+            post_content = post_content + "\n\n" + "\n".join(more_photos)
+
         unique_keys = {
-            "content": self.ig_post.text,
+            "content": post_content,
             "h": "entry",
-            "photo": uploaded_urls,
+            "photo": main_photo,
             "syndication": DETAIL_URL.format(self.ig_post.code),
         }
-        multi_keys = [
-            ("mp-syndicate-to", "twitter"),  # Should read from mp_config
-            ("mp-syndicate-to", "mastodon"),
-        ]
+        multi_keys = []
+        if syndicate:
+            multi_keys = [
+                ("mp-syndicate-to", "twitter"),  # Should read from mp_config
+                ("mp-syndicate-to", "mastodon"),
+            ]
         body = list(unique_keys.items())
         body.extend(multi_keys)
         if self.publish_date:
@@ -215,9 +266,22 @@ class Post:
         photo_url = _upload_media(media_endpoint, media_fh, site.token, filename)
         return photo_url
 
-    def post(self, site):
+    def print(self, site, syndicate):
+        body = self.build_body(self.ig_post.picture_urls, False)
+        body = dict(body)
+        log.debug("Would post to: {}".format(site.endpoint))
+        log.debug("Text: {}".format(body["content"]))
+        log.debug("Syndicate: {}".format(syndicate))
+        log.debug("Photos to post:")
+        log.debug("\n".join(self.ig_post.picture_urls))
+        if not self.publish_date:
+            log.debug("No Date, will use today")
+        else:
+            log.debug("Publish as: {}".format(self.publish_date))
+
+    def post(self, site, syndicate):
         uploaded_urls = self.upload_media(site)
-        body = self.build_body(uploaded_urls)
+        body = self.build_body(uploaded_urls, syndicate)
         log.debug("Posting to {}".format(site.endpoint))
         body = urlencode(body, doseq=True).encode("utf-8")
         request = Request(site.endpoint, data=body, headers=site.headers)
@@ -230,23 +294,27 @@ class Post:
             return response.reason
 
 
-def post_single_ig_post(site, pic_url, publish_date):
+def post_single_ig_post(site, pub_url, publish_date, syndicate, commit):
     # A single IG post can have multiple pictures.
-    ig_post = IGPost.from_url(pic_url)
+    ig_post = IGPost.from_url(pub_url)
     publish_date = publish_date or ig_post.publish_date
     post = Post(ig_post, publish_date)
-    post.post(site)
+    if commit:
+        post.post(site, syndicate)
+    else:
+        post.print(site, syndicate)
 
 
-def _run_script(config, pic_urls, publish_date):
+def run_script(config, publication_urls, publish_date, syndicate, commit):
     """
     Wrapper function because we don't want anything else in the global scope.
     """
     mp_endpoint = config["endpoint"]
     token = config["token"]
     site = MicroPubSite(mp_endpoint, token)
-    for pic_url in pic_urls:
-        post_single_ig_post(site, pic_url, publish_date)
+    commit = False
+    for pub_url in publication_urls:
+        post_single_ig_post(site, pub_url, publish_date, syndicate, commit)
     log.info("Done!")
 
 
@@ -257,18 +325,44 @@ def parse_args():
         type=argparse.FileType("r", encoding="utf-8"))
     parser.add_argument('urls', nargs="+")
     parser.add_argument('-d', '--date', default=None)
+    parser.add_argument('--commit', type=str2bool, nargs='?', const=True, default=True)
+    parser.add_argument('--syndicate', type=str2bool, nargs='?', const=True, default=True)
     args = parser.parse_args()
     return args
 
 
-def __main():
+def main():
     args = parse_args()
     config = json.load(args.config)
     publish_date = datetime.fromisoformat(args.date) if args.date else None
-    pic_urls = args.urls
+    publication_urls = args.urls
+    syndicate = args.syndicate
+    commit = args.commit
 
-    _run_script(config, pic_urls, publish_date)
+    run_script(config, publication_urls, publish_date, syndicate, commit)
 
 
 if __name__ == "__main__":
-    __main()
+    """
+    uGram - Instagram to Micropub Publisher
+
+    Posts Instagram content to your Micropub-enabled blog/website.
+
+    Usage:
+        python ugram.py config.json <IG_POST_URL> [<IG_POST_URL> ...] [OPTIONS]
+
+    Arguments:
+        config       Path to JSON config file with 'endpoint', 'token', and 'user' fields
+        urls         One or more Instagram post URLs to publish
+
+    Options:
+        -d, --date DATE       Publish date in ISO format (YYYY-MM-DD). Defaults to post's original date
+        --commit BOOL         Whether to actually post (True) or dry-run (False). Default: True
+        --syndicate BOOL      Whether to syndicate to configured platforms. Default: True
+
+    Examples:
+        python ugram.py config.json https://www.instagram.com/p/ABC123/
+        python ugram.py config.json https://www.instagram.com/p/ABC123/ --commit=False
+        python ugram.py config.json https://www.instagram.com/p/ABC123/ -d 2024-01-15 --syndicate=False
+    """
+    main()
